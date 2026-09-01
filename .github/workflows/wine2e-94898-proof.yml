@@ -1,0 +1,103 @@
+# TEMPORARY single-use A/B proof workflow for salvage of PR #94898 (issue #94857).
+# Lives ONLY on the wine2e/94898-proof branch; never merges. Delete branch after
+# the proof runs are captured.
+#
+# Proves on windows-latest:
+#   BASE leg (origin/main scripts/install.ps1): with a KiCad-style third-party
+#     embedded python.exe (CPython 3.11) first on PATH and no uv-managed Python,
+#     the installer binds the Hermes venv to the rogue interpreter (#94857 FIRES).
+#   HEAD leg (salvage fix): the installer refuses non-managed interpreters and
+#     provisions a private Hermes-managed Python under
+#     <InstallDir>\.hermes-runtime\python (symptom FIXED).
+name: wine2e-94898-proof
+on:
+  push:
+    branches: [wine2e/94898-proof]
+
+jobs:
+  ab-proof:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        id: py311
+        with:
+          python-version: '3.11'
+
+      - name: Stage rogue KiCad-style embedded Python 3.11
+        run: |
+          $ErrorActionPreference = "Stop"
+          $src = "${{ steps.py311.outputs.python-path }}" | Split-Path -Parent
+          $dst = "C:\KiCadSim\9.0\bin"
+          New-Item -ItemType Directory -Force -Path "C:\KiCadSim\9.0" | Out-Null
+          Copy-Item -Recurse -Force $src $dst
+          $ver = & "$dst\python.exe" --version
+          Write-Host "Rogue interpreter staged: $dst\python.exe ($ver)"
+          if (Test-Path "$env:APPDATA\uv\python") { Remove-Item -Recurse -Force "$env:APPDATA\uv\python" }
+
+      - name: BASE leg - origin/main install.ps1 binds venv to rogue python
+        run: |
+          $ErrorActionPreference = "Stop"
+          git checkout origin/main -- scripts/install.ps1
+          $src = Get-Content scripts/install.ps1 -Raw
+          if ($src -match "--managed-python") { throw "PREMISE ERROR: base already has the managed-python provenance guard" }
+          $env:PATH = "C:\KiCadSim\9.0\bin;" + $env:PATH
+          $env:HERMES_HOME = "C:\hermesA"
+          $installDir = "C:\hermesA\hermes-agent"
+          New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+          foreach ($stage in @("uv","python","venv")) {
+            Write-Host "=== BASE stage $stage ==="
+            powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1 -Stage $stage -NonInteractive -Json
+            if ($LASTEXITCODE -ne 0) { throw "BASE stage $stage failed with $LASTEXITCODE" }
+          }
+          $cfg = Get-Content "$installDir\venv\pyvenv.cfg" -Raw
+          Write-Host "--- BASE pyvenv.cfg ---"
+          Write-Host $cfg
+          $home_ = (($cfg -split "`r?`n" | Where-Object { $_ -match "^home = " }) -replace "^home = ","").Trim()
+          $isRogue = ($home_ -like "C:\KiCadSim*") -or ($home_ -like "C:\hostedtoolcache*")
+          if (-not $isRogue) {
+            throw "BASE leg did NOT bind to a third-party interpreter (home=$home_) - symptom did not fire"
+          }
+          if ($home_ -like "*\.hermes-runtime\*") { throw "BASE unexpectedly used a managed root" }
+          Write-Host "SYMPTOM FIRED: base venv bound to third-party Python at $home_"
+
+      - name: Restore HEAD install.ps1
+        run: |
+          git checkout HEAD -- scripts/install.ps1
+          $src = Get-Content scripts/install.ps1 -Raw
+          if ($src -notmatch "--managed-python") { throw "HEAD restore failed: fix marker missing" }
+
+      - name: HEAD leg - fixed install.ps1 refuses rogue, uses managed python
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:PATH = "C:\KiCadSim\9.0\bin;" + $env:PATH
+          $env:HERMES_HOME = "C:\hermesB"
+          $installDir = "C:\hermesB\hermes-agent"
+          New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+          foreach ($stage in @("uv","python","venv")) {
+            Write-Host "=== HEAD stage $stage ==="
+            powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1 -Stage $stage -NonInteractive -Json
+            if ($LASTEXITCODE -ne 0) { throw "HEAD stage $stage failed with $LASTEXITCODE" }
+          }
+          $cfg = Get-Content "$installDir\venv\pyvenv.cfg" -Raw
+          Write-Host "--- HEAD pyvenv.cfg ---"
+          Write-Host $cfg
+          $home_ = (($cfg -split "`r?`n" | Where-Object { $_ -match "^home = " }) -replace "^home = ","").Trim()
+          if (($home_ -like "C:\KiCadSim*") -or ($home_ -like "C:\hostedtoolcache*")) {
+            throw "HEAD leg still bound to third-party interpreter: $home_"
+          }
+          $managedRoot = Join-Path $installDir ".hermes-runtime\python"
+          if (-not ($home_ -like "$managedRoot*")) {
+            throw "HEAD leg interpreter not under managed root ($managedRoot): home=$home_"
+          }
+          $venvPy = "$installDir\venv\Scripts\python.exe"
+          $out = & $venvPy -c "print('MANAGED_OK')"
+          if ($out -ne "MANAGED_OK") { throw "HEAD venv python failed to run" }
+          Write-Host "FIX CONFIRMED: venv bound to Hermes-managed Python at $home_"
